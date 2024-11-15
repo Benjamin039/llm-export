@@ -1870,12 +1870,15 @@ class Decoder(torch.nn.Module):
         self.hidden_size = config.hidden_size
         # chatglm
         self.alpha = (2 * config.num_hidden_layers) ** 0.5 if config.model_type == 'chatglm' else 1.0
+        self.config = config
+        self.rotary = Rotary(self.config)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        rotary_pos_emb: Optional[torch.Tensor] = None,
+        #rotary_pos_emb: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         cross_attention_states: Optional[torch.Tensor] = None,
         cross_attention_mask: Optional[torch.Tensor] = None,
@@ -1884,6 +1887,8 @@ class Decoder(torch.nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         norm_hidden_states = hidden_states
+        #Achieve the rotary_pos_emb
+        rotary_pos_emb = self.rotary(position_ids)
         # Self Attention
         hidden_states, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -2236,6 +2241,8 @@ class LlmExporter(torch.nn.Module):
         self.quant_block = args.quant_block
         self.symmetric = args.sym
         self.mnnconvert = args.mnnconvert
+        #split option
+        self.export_split = args.export_split
         if self.tokenizer_path is None:
             self.tokenizer_path = self.path
         if args.lm_quant_bit is not None:
@@ -2405,17 +2412,18 @@ class LlmExporter(torch.nn.Module):
                 input_ids: torch.Tensor,
                 attention_mask: torch.Tensor,
                 position_ids: torch.Tensor,
-                past_key_values: Optional[list[torch.Tensor]] = None,
+                past_key_values: Optional[List[torch.Tensor]] = None,
                 cross_attention_states: Optional[torch.Tensor] = None,
                 cross_attention_mask: Optional[torch.Tensor] = None,
                 ):
         hidden_states = input_ids # llm forward without embedding
         presents = [None for i in range(self.num_hidden_layers)]
-        rotary_pos_emb = self.rotary(position_ids)
+        #rotary_pos_emb = self.rotary(position_ids)
+        #Achieve the rotary_pos_emb inside the block
         for i in range(self.num_hidden_layers):
             if self.blocks[i].cross_decoder and cross_attention_states is None:
                 continue
-            hidden_states, kv = self.blocks[i](hidden_states, rotary_pos_emb, attention_mask, past_key_values[i])
+            hidden_states, kv = self.blocks[i](hidden_states, attention_mask, position_ids, past_key_values[i])
             presents[i] = kv
         logits = self.lm(hidden_states)
         if not self.ppl:
@@ -2681,6 +2689,8 @@ class LlmExporter(torch.nn.Module):
         self.export_tokenizer()
         self.export_config(export_mnn)
         self.export_embed()
+        if self.export_split:
+            self.export_blocks()
         if self.visual:
             visual_onnx = self.export_visual()
             #if not self.skip_slim:
@@ -2853,7 +2863,35 @@ class LlmExporter(torch.nn.Module):
                     line = base64.b64encode(v.encode('utf-8')).decode("utf8") + "\n"
                     fp.write(line)
         return file_path
+    
+    
+    def export_blocks(self):
+        for i in range(self.num_hidden_layers):
+            self.export_block(i)
 
+    @spinner_run(f'export the blocks to ')
+    def export_block(self, block_id: int):
+        self.seq_len = 3
+        self.token_len = 0
+        inputs_embeds = torch.randn((self.seq_len, 1, self.hidden_size))
+        attention_mask =  self.get_attention_mask()
+        position_ids = self.get_position_ids()
+        past_key_values = torch.zeros(self.past_kv_shape[1:])
+        onnx_model = f'./{self.onnx_path}/block_{block_id}.onnx'
+        model = self.blocks[block_id]
+        #export the block to onnx
+        torch.onnx.export(
+            model, (inputs_embeds, attention_mask, position_ids, past_key_values),
+            onnx_model,
+            input_names=[
+                'inputs_embeds', 'attention_mask', 'position_ids', 'past_key_values'
+            ],
+            output_names=['hidden_states', 'present_key_value'],
+            dynamic_axes=self.block_dynamic_axes,
+            do_constant_folding=True,
+            verbose=False,
+            opset_version=15)
+        return onnx_model        
 
 class EmbeddingExporter(LlmExporter):
     def __init__(self, args):
@@ -3049,6 +3087,8 @@ def main():
     parser.add_argument('--ppl', action='store_true', help='Whether or not to get all logits of input tokens.')
     parser.add_argument('--awq', action='store_true', help='Whether or not to use awq quant.')
     parser.add_argument('--sym', action='store_true', help='Whether or not to using symmetric quant (without zeropoint), defualt is False.')
+    #check the split option
+    parser.add_argument('--export_split',action='store_true',help='Whether or not to split the model into blocks.')
 
     args = parser.parse_args()
 
